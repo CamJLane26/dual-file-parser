@@ -167,7 +167,13 @@ if (isNaN(numRecords) || numRecords < 1) {
   process.exit(1);
 }
 
-const outputPath = path.join(__dirname, `sample-${numRecords}.${extension}`);
+const outputDir = path.join(__dirname);
+const outputPath = path.join(outputDir, `sample-${numRecords}.${extension}`);
+
+// Ensure output directory exists
+if (!fs.existsSync(outputDir)) {
+  fs.mkdirSync(outputDir, { recursive: true });
+}
 
 // Run the generator
 (async () => {

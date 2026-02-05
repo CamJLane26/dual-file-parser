@@ -19,6 +19,10 @@ sandbox/*.css
 # Storage directory (uploaded files)
 storage/
 
+# Generated sample files
+sandbox/sample-*.csv
+sandbox/sample-*.txt
+
 # Environment variables
 .env
 .env.local

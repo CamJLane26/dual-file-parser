@@ -5,7 +5,7 @@ A TypeScript microservice for parsing CSV and text files with streaming support.
 ## Features
 
 - **Multi-format support**: Parses `.csv` files and `.txt` files (both comma-separated and tab-separated)
-- **Auto-detection**: Automatically detects delimiter (comma vs tab) based on file content analysis
+- **Auto-detection with manual override**: Automatically detects delimiter from file content with UI dropdown to override if needed
 - **Streaming parser**: Memory-efficient streaming for handling large files (100s of MB to 1+ GB)
 - **Memory management**: Automatic garbage collection, batch throttling, and heap size control for large datasets
 - **Dynamic schema**: Automatically creates field mappings from CSV headers
@@ -50,7 +50,12 @@ npm start
 
 ## How It Works
 
-1. Upload → 2. Auto-detect delimiter → 3. Stream parse → 4. Transform to objects → 5. Batch insert (100) → 6. Progress via SSE
+1. Upload file → 2. Auto-detect delimiter (with manual override option) → 3. Stream parse → 4. Transform to objects → 5. Batch insert (100) → 6. Progress via SSE
+
+**UI Features:**
+- File type dropdown automatically sets to detected format (CSV/TSV/TXT)
+- Users can override detection before parsing if needed
+- Detection info displayed after file selection
 
 ## API Endpoints
 

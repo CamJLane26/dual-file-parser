@@ -19,9 +19,54 @@ const BATCH_FLUSH_INTERVAL_MS = parseInt(process.env.BATCH_FLUSH_INTERVAL_MS || 
 const USE_DATABASE = process.env.USE_DATABASE !== 'false'; // Default to true
 const TABLE_NAME = process.env.DB_TABLE_NAME || 'records';
 const USE_DYNAMIC_SCHEMA = process.env.USE_DYNAMIC_SCHEMA !== 'false'; // Default to true
+const STORAGE_DIR = process.env.STORAGE_DIR || path.join(process.cwd(), 'storage');
+const STORAGE_MAX_AGE_MS = parseInt(process.env.STORAGE_MAX_AGE_MS || '3600000', 10); // 1 hour default
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+/**
+ * Clean up old files in storage directory (handles orphaned files from crashes)
+ */
+function cleanupOldStorageFiles(): void {
+  try {
+    if (!fs.existsSync(STORAGE_DIR)) {
+      return;
+    }
+
+    const files = fs.readdirSync(STORAGE_DIR);
+    const now = Date.now();
+    let cleanedCount = 0;
+
+    for (const file of files) {
+      if (!file.startsWith('data-upload-')) {
+        continue; // Skip non-upload files
+      }
+
+      const filePath = path.join(STORAGE_DIR, file);
+      try {
+        const stats = fs.statSync(filePath);
+        const age = now - stats.mtimeMs;
+
+        if (age > STORAGE_MAX_AGE_MS) {
+          fs.unlinkSync(filePath);
+          cleanedCount++;
+        }
+      } catch (err) {
+        console.error(`[Cleanup] Error processing file ${file}:`, err);
+      }
+    }
+
+    if (cleanedCount > 0) {
+      console.log(`[Cleanup] Removed ${cleanedCount} orphaned file(s) from storage`);
+    }
+  } catch (err) {
+    console.error('[Cleanup] Error cleaning storage directory:', err);
+  }
+}
+
+// Clean up orphaned files on startup
+cleanupOldStorageFiles();
 
 app.get('/health', (req: Request, res: Response): void => {
   res.json({ status: 'ok' });
@@ -34,6 +79,7 @@ app.get('/', (req: Request, res: Response): void => {
 app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   const filePath = (req as any).filePath as string;
   const originalName = (req as any).originalName as string;
+  const userDelimiter = req.body?.delimiter; // User's delimiter preference (optional)
   let fileStream: Readable | undefined;
   let dbClient: any = null;
   const batchId = `batch-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
@@ -42,10 +88,29 @@ app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: N
   console.log(`[Upload] Original filename: ${originalName}`);
   console.log(`[Parse] Starting parse with batch ID: ${batchId}`);
 
+  // Helper function to clean up temporary file
+  const cleanupFile = () => {
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+        console.log(`[Cleanup] Deleted temporary file: ${filePath}`);
+      } catch (unlinkError) {
+        console.error('[Cleanup] Error deleting temp file:', unlinkError);
+      }
+    }
+  };
+
   try {
-    // Detect file format (CSV, TSV, or TXT)
-    const detectedFormat = detectFileFormat(filePath);
-    console.log(`[Parse] Detected format: ${detectedFormat.format}, delimiter: ${detectedFormat.delimiter === '\t' ? 'TAB' : detectedFormat.delimiter}, confidence: ${(detectedFormat.confidence * 100).toFixed(1)}%`);
+    // Detect file format (CSV, TSV, or TXT) or use user preference
+    let detectedFormat = detectFileFormat(filePath);
+    
+    if (userDelimiter) {
+      // User specified delimiter overrides auto-detection
+      detectedFormat.delimiter = userDelimiter;
+      console.log(`[Parse] Using user-specified delimiter: ${userDelimiter === '\t' ? 'TAB' : userDelimiter}`);
+    } else {
+      console.log(`[Parse] Auto-detected delimiter: ${detectedFormat.delimiter === '\t' ? 'TAB' : detectedFormat.delimiter}, confidence: ${(detectedFormat.confidence * 100).toFixed(1)}%`);
+    }
 
     // Count records for progress tracking
     const totalRecordCount = await countRecords(filePath, detectedFormat.delimiter);
@@ -54,6 +119,7 @@ app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: N
     // Create a fresh stream for parsing
     fileStream = fs.createReadStream(filePath);
     if (!fileStream) {
+      cleanupFile(); // Clean up before returning
       res.status(400).json({ error: 'No file stream available' });
       return;
     }
@@ -156,8 +222,8 @@ app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: N
         }
       }
 
-      // Trigger manual GC every 100K records (--expose-gc flag in package.json)
-      if (recordCount % 100000 === 0) {
+      // Trigger manual GC and log memory every 100 records (--expose-gc flag in package.json)
+      if (recordCount % 100 === 0) {
         console.log(`[Parse] Processed ${recordCount.toLocaleString()} records...`);
         if (global.gc) {
           global.gc();
@@ -217,6 +283,7 @@ app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: N
     // Send error via SSE before ending
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('[Parse] Error:', errorMessage);
+    console.error('[Parse] Parsing failed - cleaning up temporary file');
     res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
     res.end();
     next(error);
@@ -226,20 +293,53 @@ app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: N
       dbClient.release();
     }
 
-    // Clean up temporary file
-    if (filePath && fs.existsSync(filePath)) {
-      try {
-        fs.unlinkSync(filePath);
-      } catch (unlinkError) {
-        console.error('[Parse] Error deleting temp file:', unlinkError);
-      }
-    }
+    // Clean up temporary file (always executes, even on error)
+    cleanupFile();
   }
 });
 
 app.use((err: Error, req: Request, res: Response, next: NextFunction): void => {
   console.error('Error:', err);
   res.status(500).json({ error: err.message || 'Internal server error' });
+});
+
+// Handle uncaught exceptions (including heap overflow errors)
+process.on('uncaughtException', async (err: Error) => {
+  console.error('UNCAUGHT EXCEPTION! Shutting down...');
+  console.error(err.name, err.message);
+  console.error(err.stack);
+  
+  // Attempt cleanup before crash
+  console.log('[Emergency] Attempting to clean up storage directory...');
+  try {
+    cleanupOldStorageFiles();
+  } catch (cleanupErr) {
+    console.error('[Emergency] Cleanup failed:', cleanupErr);
+  }
+  
+  if (USE_DATABASE) {
+    try {
+      await closePool();
+    } catch (poolErr) {
+      console.error('[Emergency] Pool close failed:', poolErr);
+    }
+  }
+  process.exit(1);
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', async (reason: any) => {
+  console.error('UNHANDLED REJECTION! Shutting down...');
+  console.error(reason);
+  
+  if (USE_DATABASE) {
+    try {
+      await closePool();
+    } catch (poolErr) {
+      console.error('[Emergency] Pool close failed:', poolErr);
+    }
+  }
+  process.exit(1);
 });
 
 // Graceful shutdown
