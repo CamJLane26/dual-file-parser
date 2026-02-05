@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+
+# Build output
+build/
+dist/
+
+# Sandbox directory
+sandbox/*.tsv
+sandbox/*.csv
+sandbox/*.txt
+sandbox/*.xml
+sandbox/*.json
+sandbox/*.yaml
+sandbox/*.yml
+sandbox/*.html
+sandbox/*.css
+
+# Storage directory (uploaded files)
+storage/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test coverage
+coverage/
+
+# Temporary files
+tmp/
+temp/
+
+# Sandbox generated test files
+sandbox/*.csv
+sandbox/*.tsv
+sandbox/*.txt
+sandbox/*.xml

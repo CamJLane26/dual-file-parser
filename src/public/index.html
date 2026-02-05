@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CSV/TXT File Parser</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+      max-width: 900px;
+      margin: 50px auto;
+      padding: 20px;
+      background: #f5f7fa;
+      color: #333;
+    }
+    h1 {
+      color: #2c3e50;
+      margin-bottom: 10px;
+    }
+    .subtitle {
+      color: #7f8c8d;
+      margin-bottom: 30px;
+    }
+    .upload-form {
+      background: #fff;
+      padding: 30px;
+      border-radius: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      margin-bottom: 20px;
+    }
+    .file-input {
+      margin: 15px 0;
+    }
+    .file-input label {
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 500;
+      color: #34495e;
+    }
+    input[type="file"] {
+      padding: 12px;
+      width: 100%;
+      border: 2px dashed #bdc3c7;
+      border-radius: 8px;
+      background: #fafafa;
+      cursor: pointer;
+      transition: border-color 0.2s;
+    }
+    input[type="file"]:hover {
+      border-color: #3498db;
+    }
+    .supported-formats {
+      font-size: 13px;
+      color: #7f8c8d;
+      margin-top: 8px;
+    }
+    button {
+      background: linear-gradient(135deg, #3498db, #2980b9);
+      color: white;
+      padding: 14px 28px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 16px;
+      font-weight: 500;
+      transition: transform 0.1s, box-shadow 0.2s;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(52, 152, 219, 0.4);
+    }
+    button:disabled {
+      background: #bdc3c7;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+    .progress {
+      margin: 20px 0;
+      display: none;
+    }
+    .progress-bar {
+      width: 100%;
+      height: 24px;
+      background: #ecf0f1;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #3498db, #2ecc71);
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+    .progress-text {
+      margin-top: 10px;
+      font-size: 14px;
+      color: #7f8c8d;
+    }
+    .format-info {
+      margin-top: 10px;
+      padding: 10px 15px;
+      background: #e8f4fd;
+      border-radius: 6px;
+      font-size: 13px;
+      color: #2980b9;
+      display: none;
+    }
+    .results {
+      margin-top: 20px;
+      padding: 25px;
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+      display: none;
+    }
+    .error {
+      color: #e74c3c;
+      background: #fdf2f2;
+      padding: 15px;
+      border-radius: 8px;
+      margin-top: 15px;
+      display: none;
+      border-left: 4px solid #e74c3c;
+    }
+    .summary {
+      margin-bottom: 20px;
+      padding: 20px;
+      background: linear-gradient(135deg, #e8f4fd, #d4edfc);
+      border-radius: 8px;
+    }
+    .summary h3 {
+      margin: 0 0 15px 0;
+      color: #2980b9;
+    }
+    .summary p {
+      margin: 8px 0;
+      color: #34495e;
+    }
+    .summary .stat {
+      display: inline-block;
+      padding: 8px 16px;
+      background: #fff;
+      border-radius: 20px;
+      margin: 5px 5px 5px 0;
+      font-size: 13px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .summary .stat strong {
+      color: #2980b9;
+    }
+    pre {
+      background: #2c3e50;
+      color: #ecf0f1;
+      padding: 20px;
+      border-radius: 8px;
+      overflow-x: auto;
+      max-height: 400px;
+      overflow-y: auto;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .section-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 15px;
+    }
+    .section-title h3 {
+      margin: 0;
+      color: #34495e;
+    }
+    .total-count-info {
+      margin-bottom: 15px;
+      padding: 12px 18px;
+      background: #d5f5e3;
+      border-radius: 8px;
+      font-weight: 500;
+      color: #27ae60;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <h1>CSV/TXT File Parser</h1>
+  <p class="subtitle">Upload and parse CSV files or text files (comma or tab-separated)</p>
+  
+  <div class="upload-form">
+    <form id="uploadForm" enctype="multipart/form-data">
+      <div class="file-input">
+        <label for="datafile">Select Data File:</label>
+        <input type="file" id="datafile" name="datafile" accept=".csv,.txt" required>
+        <p class="supported-formats">Supported formats: .csv and .txt files (delimiter auto-detected from content)</p>
+      </div>
+      <button type="submit" id="submitBtn">Parse File</button>
+    </form>
+    
+    <div class="progress" id="progress">
+      <div class="total-count-info" id="totalCountInfo">
+        Total records found: <span id="totalCount">0</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <p class="progress-text" id="progressText">Uploading and parsing...</p>
+      <div class="format-info" id="formatInfo"></div>
+    </div>
+    
+    <div class="error" id="error"></div>
+  </div>
+  
+  <div class="results" id="results">
+    <div class="summary" id="summary">
+      <h3>Parse Summary</h3>
+      <p id="recordCount">Parsing...</p>
+      <div id="statsContainer"></div>
+    </div>
+    
+    <div class="section-title">
+      <h3>Sample Records (first 20):</h3>
+    </div>
+    <pre id="resultsContent"></pre>
+  </div>
+
+  <script>
+    const form = document.getElementById('uploadForm');
+    const submitBtn = document.getElementById('submitBtn');
+    const progress = document.getElementById('progress');
+    const progressFill = document.getElementById('progressFill');
+    const progressText = document.getElementById('progressText');
+    const totalCountInfo = document.getElementById('totalCountInfo');
+    const totalCount = document.getElementById('totalCount');
+    const formatInfo = document.getElementById('formatInfo');
+    const results = document.getElementById('results');
+    const resultsContent = document.getElementById('resultsContent');
+    const error = document.getElementById('error');
+    const recordCount = document.getElementById('recordCount');
+    const statsContainer = document.getElementById('statsContainer');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      
+      const fileInput = document.getElementById('datafile');
+      if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+        showError('Please select a file');
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('datafile', fileInput.files[0]);
+
+      submitBtn.disabled = true;
+      progress.style.display = 'block';
+      results.style.display = 'none';
+      error.style.display = 'none';
+      totalCountInfo.style.display = 'none';
+      formatInfo.style.display = 'none';
+      progressFill.style.width = '0%';
+      progressText.textContent = 'Uploading and analyzing file...';
+
+      try {
+        const response = await fetch('/parse', {
+          method: 'POST',
+          body: formData
+        });
+
+        if (!response.ok) {
+          throw new Error('Failed to parse file');
+        }
+
+        if (!response.body) {
+          throw new Error('No response body');
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let finalData = null;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          
+          if (done) {
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                
+                if (data.error) {
+                  throw new Error(data.error);
+                }
+                
+                if (data.done) {
+                  finalData = data;
+                } else if (data.progress !== undefined) {
+                  // Show total count when we first receive it
+                  if (data.total > 0 && totalCountInfo.style.display === 'none') {
+                    totalCount.textContent = data.total.toLocaleString();
+                    totalCountInfo.style.display = 'block';
+                  }
+                  
+                  // Update progress bar
+                  const progressPercent = Math.min(100, Math.max(0, data.progress));
+                  progressFill.style.width = `${progressPercent}%`;
+                  
+                  if (data.total > 0) {
+                    progressText.textContent = `Parsing: ${data.current.toLocaleString()} / ${data.total.toLocaleString()} records (${progressPercent}%)`;
+                  } else {
+                    progressText.textContent = `Parsing: ${data.current.toLocaleString()} records...`;
+                  }
+                }
+              } catch (e) {
+                if (e instanceof Error && e.message !== 'Unexpected end of JSON input') {
+                  console.error('Error parsing SSE data:', e);
+                }
+              }
+            }
+          }
+        }
+
+        if (finalData) {
+          const totalRecords = finalData.count || 0;
+          const sampleRecords = finalData.sample || [];
+          const format = finalData.format || 'unknown';
+          const delimiter = finalData.delimiter || 'unknown';
+          
+          recordCount.textContent = `Total records parsed: ${totalRecords.toLocaleString()}`;
+          
+          // Build stats
+          let statsHtml = '';
+          statsHtml += `<span class="stat"><strong>Format:</strong> ${format.toUpperCase()}</span>`;
+          statsHtml += `<span class="stat"><strong>Delimiter:</strong> ${delimiter === 'tab' ? 'Tab' : delimiter}</span>`;
+          statsHtml += `<span class="stat"><strong>Records:</strong> ${totalRecords.toLocaleString()}</span>`;
+          if (finalData.batchId) {
+            statsHtml += `<span class="stat"><strong>Batch ID:</strong> ${finalData.batchId}</span>`;
+          }
+          statsContainer.innerHTML = statsHtml;
+
+          // Show format info
+          formatInfo.textContent = `Detected format: ${format.toUpperCase()} with ${delimiter === 'tab' ? 'tab' : delimiter} delimiter`;
+          formatInfo.style.display = 'block';
+
+          const sampleSize = sampleRecords.length;
+          const sampleData = { records: sampleRecords };
+          resultsContent.textContent = JSON.stringify(sampleData, null, 2);
+          
+          results.style.display = 'block';
+        }
+
+        progress.style.display = 'none';
+      } catch (err) {
+        showError(err instanceof Error ? err.message : 'An error occurred');
+        progress.style.display = 'none';
+      } finally {
+        submitBtn.disabled = false;
+        progressFill.style.width = '0%';
+      }
+    });
+
+    function showError(message) {
+      error.textContent = message;
+      error.style.display = 'block';
+    }
+  </script>
+</body>
+</html>
