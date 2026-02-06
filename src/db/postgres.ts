@@ -57,11 +57,16 @@ export async function insertRecordsBatch(
   client: PoolClient,
   records: ParsedObject[],
   tableName: string = 'records',
-  batchId?: string
+  batchId?: string,
+  metadata?: Record<string, string>
 ): Promise<number> {
   if (records.length === 0) {
     return 0;
   }
+
+  const metadataJson = metadata && Object.keys(metadata).length > 0
+    ? JSON.stringify(metadata)
+    : null;
 
   // Build the INSERT query with parameterized values
   const values: unknown[] = [];
@@ -70,13 +75,13 @@ export async function insertRecordsBatch(
 
   for (const record of records) {
     const recordJson = JSON.stringify(record);
-    placeholders.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2})`);
-    values.push(batchId || null, recordJson, new Date());
-    paramIndex += 3;
+    placeholders.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3})`);
+    values.push(batchId || null, recordJson, metadataJson, new Date());
+    paramIndex += 4;
   }
 
   const query = `
-    INSERT INTO ${tableName} (batch_id, data, created_at)
+    INSERT INTO ${tableName} (batch_id, data, metadata, created_at)
     VALUES ${placeholders.join(', ')}
   `;
 
@@ -96,6 +101,7 @@ export async function ensureTableExists(
       id SERIAL PRIMARY KEY,
       batch_id VARCHAR(255),
       data JSONB NOT NULL,
+      metadata JSONB,
       created_at TIMESTAMP NOT NULL DEFAULT NOW()
     )
   `;

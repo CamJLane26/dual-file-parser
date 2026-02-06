@@ -22,6 +22,10 @@ const USE_DYNAMIC_SCHEMA = process.env.USE_DYNAMIC_SCHEMA !== 'false'; // Defaul
 const STORAGE_DIR = process.env.STORAGE_DIR || path.join(process.cwd(), 'storage');
 const STORAGE_MAX_AGE_MS = parseInt(process.env.STORAGE_MAX_AGE_MS || '3600000', 10); // 1 hour default
 
+// Store API job results temporarily (in production, use Redis)
+const apiJobResults = new Map<string, any>();
+const JOB_RESULT_TTL = 3600000; // Keep results for 1 hour
+
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -75,6 +79,305 @@ app.get('/health', (req: Request, res: Response): void => {
 app.get('/', (req: Request, res: Response): void => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
+
+/**
+ * API: Upload and parse CSV file (returns job ID for polling)
+ */
+app.post('/api/parse', uploadMiddleware, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  const filePath = (req as any).filePath as string;
+  const originalName = (req as any).originalName as string;
+  const userDelimiter = req.body?.delimiter;
+  const jobId = `job-${Date.now()}-${Math.round(Math.random() * 1E9)}`;
+
+  // Extract optional uploader metadata from multipart form fields
+  const metadata: Record<string, string> = {};
+  if (req.body?.name) metadata.name = req.body.name;
+  if (req.body?.email) metadata.email = req.body.email;
+  // Pass through any extra fields prefixed with "meta_"
+  for (const [key, value] of Object.entries(req.body || {})) {
+    if (key.startsWith('meta_') && typeof value === 'string') {
+      metadata[key.replace('meta_', '')] = value;
+    }
+  }
+
+  console.log(`[API] File uploaded: ${filePath}`);
+  console.log(`[API] Original filename: ${originalName}`);
+  console.log(`[API] Job ID: ${jobId}`);
+  if (Object.keys(metadata).length > 0) {
+    console.log(`[API] Metadata: ${JSON.stringify(metadata)}`);
+  }
+
+  try {
+    // Detect file format
+    let detectedFormat = detectFileFormat(filePath);
+    if (userDelimiter) {
+      detectedFormat.delimiter = userDelimiter;
+    }
+
+    // Count records
+    const totalRecordCount = await countRecords(filePath, detectedFormat.delimiter);
+
+    // Initialize job status
+    apiJobResults.set(jobId, {
+      id: jobId,
+      status: 'processing',
+      progress: 0,
+      current: 0,
+      total: totalRecordCount,
+      format: detectedFormat.format,
+      delimiter: detectedFormat.delimiter === '\t' ? 'tab' : detectedFormat.delimiter,
+      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+      createdAt: new Date().toISOString(),
+    });
+
+    // Clean up after 1 hour
+    setTimeout(() => {
+      apiJobResults.delete(jobId);
+      console.log(`[API] Cleaned up job result: ${jobId}`);
+    }, JOB_RESULT_TTL);
+
+    // Return job ID immediately
+    res.json({
+      success: true,
+      jobId,
+      status: 'processing',
+      totalRecords: totalRecordCount,
+      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+      statusUrl: `/api/status/${jobId}`,
+      resultUrl: `/api/result/${jobId}`,
+    });
+
+    // Process file in background
+    processFileInBackground(jobId, filePath, detectedFormat, originalName, metadata);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error('[API] Error:', errorMessage);
+    
+    if (apiJobResults.has(jobId)) {
+      apiJobResults.set(jobId, {
+        ...apiJobResults.get(jobId),
+        status: 'failed',
+        error: errorMessage,
+      });
+    }
+    
+    // Clean up file
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    
+    next(error);
+  }
+});
+
+/**
+ * API: Check job status
+ */
+app.get('/api/status/:jobId', (req: Request, res: Response): void => {
+  const jobId = req.params.jobId as string;
+  const job = apiJobResults.get(jobId);
+
+  if (!job) {
+    res.status(404).json({
+      success: false,
+      error: 'Job not found or expired',
+    });
+    return;
+  }
+
+  res.json({
+    success: true,
+    job,
+  });
+});
+
+/**
+ * API: Get job result (only if completed)
+ */
+app.get('/api/result/:jobId', (req: Request, res: Response): void => {
+  const jobId = req.params.jobId as string;
+  const job = apiJobResults.get(jobId);
+
+  if (!job) {
+    res.status(404).json({
+      success: false,
+      error: 'Job not found or expired',
+    });
+    return;
+  }
+
+  if (job.status !== 'completed') {
+    res.status(400).json({
+      success: false,
+      error: `Job is ${job.status}, not completed`,
+      status: job.status,
+      progress: job.progress,
+    });
+    return;
+  }
+
+  res.json({
+    success: true,
+    result: job.result,
+  });
+});
+
+/**
+ * Process file in background for API requests
+ */
+async function processFileInBackground(
+  jobId: string,
+  filePath: string,
+  detectedFormat: any,
+  originalName: string,
+  metadata: Record<string, string> = {}
+): Promise<void> {
+  let dbClient: any = null;
+  const batchId = `batch-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+
+  const updateJob = (updates: any) => {
+    const current = apiJobResults.get(jobId) || {};
+    apiJobResults.set(jobId, { ...current, ...updates, updatedAt: new Date().toISOString() });
+  };
+
+  try {
+    const fileStream = fs.createReadStream(filePath);
+    
+    // Get database client
+    if (USE_DATABASE) {
+      try {
+        dbClient = await getClient(TABLE_NAME);
+        await dbClient.query('BEGIN');
+      } catch (dbError) {
+        console.warn('[API] Database connection failed, continuing without database:', dbError);
+      }
+    }
+
+    // Determine schema
+    let schema = defaultSchema;
+    if (USE_DYNAMIC_SCHEMA && detectedFormat.sampleHeaders) {
+      schema = createDynamicSchema(detectedFormat.sampleHeaders);
+    }
+
+    let recordCount = 0;
+    const sampleRecords: ParsedObject[] = [];
+    let batch: ParsedObject[] = [];
+    let lastBatchInsertTime = Date.now();
+    const parseOptions = createParseOptions(detectedFormat);
+
+    await parseCSVStream(fileStream, schema, async (record) => {
+      recordCount++;
+
+      // Safety check
+      if (batch.length >= MAX_BATCH_SIZE) {
+        if (USE_DATABASE && dbClient) {
+          try {
+            await insertRecordsBatch(dbClient, batch, TABLE_NAME, batchId, metadata);
+            batch = [];
+            lastBatchInsertTime = Date.now();
+          } catch (dbError) {
+            console.error('[API] Forced batch insert error:', dbError);
+            batch = [];
+          }
+        } else {
+          batch = [];
+        }
+      }
+
+      batch.push(record);
+
+      // Collect samples
+      if (sampleRecords.length < 20) {
+        sampleRecords.push(JSON.parse(JSON.stringify(record)));
+      }
+
+      // Flush batch
+      const timeSinceLastInsert = Date.now() - lastBatchInsertTime;
+      const shouldFlushByTime = batch.length > 0 && timeSinceLastInsert >= BATCH_FLUSH_INTERVAL_MS;
+
+      if (USE_DATABASE && dbClient && (batch.length >= BATCH_SIZE || shouldFlushByTime)) {
+        try {
+          await insertRecordsBatch(dbClient, batch, TABLE_NAME, batchId, metadata);
+          batch = [];
+          lastBatchInsertTime = Date.now();
+        } catch (dbError) {
+          console.error('[API] Database insert error:', dbError);
+          batch = [];
+        }
+      }
+
+      // Update progress every 1000 records
+      if (recordCount % 1000 === 0) {
+        const job = apiJobResults.get(jobId);
+        const progress = job?.total ? Math.min(100, Math.floor((recordCount / job.total) * 100)) : 0;
+        updateJob({ progress, current: recordCount });
+      }
+
+      // Trigger GC every 100 records
+      if (recordCount % 100 === 0 && global.gc) {
+        global.gc();
+      }
+    }, parseOptions);
+
+    // Insert remaining records
+    if (USE_DATABASE && dbClient && batch.length > 0) {
+      await insertRecordsBatch(dbClient, batch, TABLE_NAME, batchId, metadata);
+    }
+
+    // Commit transaction
+    if (USE_DATABASE && dbClient) {
+      await dbClient.query('COMMIT');
+    }
+
+    // Update job with final result
+    updateJob({
+      status: 'completed',
+      progress: 100,
+      current: recordCount,
+      result: {
+        count: recordCount,
+        sample: sampleRecords,
+        format: detectedFormat.format,
+        delimiter: detectedFormat.delimiter === '\t' ? 'tab' : detectedFormat.delimiter,
+        batchId: USE_DATABASE ? batchId : undefined,
+        metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+      },
+      completedAt: new Date().toISOString(),
+    });
+
+    console.log(`[API] Job ${jobId} completed: ${recordCount} records`);
+  } catch (error) {
+    if (USE_DATABASE && dbClient) {
+      try {
+        await dbClient.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.error('[API] Error during rollback:', rollbackError);
+      }
+    }
+
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error(`[API] Job ${jobId} failed:`, errorMessage);
+    
+    updateJob({
+      status: 'failed',
+      error: errorMessage,
+      failedAt: new Date().toISOString(),
+    });
+  } finally {
+    if (dbClient) {
+      dbClient.release();
+    }
+    
+    // Clean up file
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (unlinkError) {
+        console.error('[API] Error deleting temp file:', unlinkError);
+      }
+    }
+  }
+}
 
 app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
   const filePath = (req as any).filePath as string;

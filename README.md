@@ -1,6 +1,8 @@
 # Dual File Parser
 
-A TypeScript microservice for parsing CSV and text files with streaming support. Handles both comma-separated and tab-separated data, with automatic delimiter detection. Parsed records can be inserted into a PostgreSQL database as JSONB data.
+TypeScript microservice for parsing CSV/TSV/TXT files with streaming support and REST API. Features automatic delimiter detection with manual override and handles large files (100MB-1GB).
+
+📖 **[REST API Docs](./API.md)** | **[API Quick Reference](../API-QUICK-REFERENCE.md)** | **[Memory Management](./MEMORY.md)**
 
 ## Features
 
@@ -59,19 +61,38 @@ npm start
 
 ## API Endpoints
 
+### Web UI Endpoints
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | Web interface for file uploads |
-| `/health` | GET | Health check endpoint |
-| `/parse` | POST | Upload and parse a file (multipart/form-data) |
+| `/` | GET | HTML upload form |
+| `/health` | GET | Health check |
+| `/parse` | POST | Parse CSV via SSE (for built-in web UI) |
 
-### Parse Endpoint
+### REST API Endpoints (for external frontends)
 
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/parse` | POST | Upload & parse (returns job ID) |
+| `/api/status/:jobId` | GET | Check parsing progress |
+| `/api/result/:jobId` | GET | Get results after completion |
+
+📖 **See [API.md](./API.md) for complete REST API documentation with code examples**
+
+**Quick Example:**
 ```bash
-curl -X POST -F "datafile=@mydata.csv" http://localhost:3001/parse
-```
+# Upload file
+curl -X POST -F "datafile=@sample.csv" http://localhost:3001/api/parse
+# Returns: {"jobId": "job-123...", "status": "processing", "totalRecords": 10000}
 
-Returns Server-Sent Events with progress updates and final result.
+# Check status (poll every 2s)
+curl http://localhost:3001/api/status/job-123...
+# Returns: {"job": {"status": "processing", "progress": 45}}
+
+# Get results (when complete)
+curl http://localhost:3001/api/result/job-123...
+# Returns: {"result": {"count": 10000, "sample": [...], "format": "csv"}}
+```
 
 ## Configuration
 
