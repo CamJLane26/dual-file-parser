@@ -294,80 +294,76 @@ export function parseCSVStream(
     let lineNumber = 0;
     let recordCount = 0;
     let stopped = false;
+    let processing = false;
 
-    parser.on('readable', async () => {
-      let row: string[];
-      while ((row = parser.read()) !== null) {
-        if (stopped) return;
+    const processRows = async () => {
+      if (processing) return; // Prevent concurrent handler invocations
+      processing = true;
 
-        lineNumber++;
+      try {
+        let row: string[];
+        while ((row = parser.read()) !== null) {
+          if (stopped) return;
 
-        // First row is headers (if schema says so)
-        if (schema.hasHeaders !== false && headerMap === null) {
-          headerMap = new Map();
-          row.forEach((header, index) => {
-            headerMap!.set(header.toLowerCase().trim(), index);
-          });
-          continue;
-        }
+          lineNumber++;
 
-        // If no headers in file, use custom headers or column indices
-        if (headerMap === null) {
-          headerMap = new Map();
-          if (schema.customHeaders) {
-            schema.customHeaders.forEach((header, index) => {
-              headerMap!.set(header.toLowerCase(), index);
+          // First row is headers (if schema says so)
+          if (schema.hasHeaders !== false && headerMap === null) {
+            headerMap = new Map();
+            row.forEach((header, index) => {
+              headerMap!.set(header.toLowerCase().trim(), index);
             });
-          } else {
-            // Use column indices as headers
-            row.forEach((_, index) => {
-              headerMap!.set(index.toString(), index);
-            });
+            continue;
           }
-        }
 
-        // Check max records
-        if (maxRecords && recordCount >= maxRecords) {
-          stopped = true;
-          parser.end();
-          return;
-        }
-
-        // Transform the row
-        const { record, errors } = transformRow(row, headerMap, schema);
-
-        // Set line numbers on errors
-        errors.forEach(e => (e.line = lineNumber));
-
-        // Skip empty records
-        if (Object.keys(record).length === 0) {
-          continue;
-        }
-
-        recordCount++;
-
-        try {
-          await onRecord(record, lineNumber);
-        } catch (err) {
-          // If callback throws, we continue parsing but log the error
-          console.error(`[Parse] Error processing record at line ${lineNumber}:`, err);
-        }
-        
-        // Aggressively clear record to help GC (similar to xml-parser's clearElementTree)
-        Object.keys(record).forEach(key => {
-          if (typeof record[key] === 'object' && record[key] !== null) {
-            if (Array.isArray(record[key])) {
-              (record[key] as unknown[]).length = 0;
+          // If no headers in file, use custom headers or column indices
+          if (headerMap === null) {
+            headerMap = new Map();
+            if (schema.customHeaders) {
+              schema.customHeaders.forEach((header, index) => {
+                headerMap!.set(header.toLowerCase(), index);
+              });
             } else {
-              Object.keys(record[key] as object).forEach(nestedKey => {
-                delete (record[key] as Record<string, unknown>)[nestedKey];
+              // Use column indices as headers
+              row.forEach((_, index) => {
+                headerMap!.set(index.toString(), index);
               });
             }
           }
-          delete record[key];
-        });
+
+          // Check max records
+          if (maxRecords && recordCount >= maxRecords) {
+            stopped = true;
+            parser.end();
+            return;
+          }
+
+          // Transform the row
+          const { record, errors } = transformRow(row, headerMap, schema);
+
+          // Set line numbers on errors
+          errors.forEach(e => (e.line = lineNumber));
+
+          // Skip empty records
+          if (Object.keys(record).length === 0) {
+            continue;
+          }
+
+          recordCount++;
+
+          try {
+            await onRecord(record, lineNumber);
+          } catch (err) {
+            // If callback throws, we continue parsing but log the error
+            console.error(`[Parse] Error processing record at line ${lineNumber}:`, err);
+          }
+        }
+      } finally {
+        processing = false;
       }
-    });
+    };
+
+    parser.on('readable', processRows);
 
     stream.on('error', (err: Error) => {
       parser.emit('error', err);

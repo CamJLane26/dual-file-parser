@@ -5,8 +5,9 @@ import { parseCSVStream, detectFileFormat, countRecords, createParseOptions } fr
 import { defaultSchema, createDynamicSchema } from './config/recordSchema';
 import { Readable } from 'stream';
 import * as fs from 'fs';
-import { getClient, insertRecordsBatch, closePool } from './db/postgres';
+import { getDb, upsertRecordsBatch, closeDb, ensureTableExists } from './db/postgres';
 import { ParsedObject } from './types/csv';
+import { queue as asyncQueue, QueueObject } from 'async';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -17,10 +18,39 @@ const MAX_BATCH_SIZE = BATCH_SIZE * 2; // Safety limit
 const BATCH_FLUSH_INTERVAL_MS = parseInt(process.env.BATCH_FLUSH_INTERVAL_MS || '5000', 10);
 
 const USE_DATABASE = process.env.USE_DATABASE !== 'false'; // Default to true
-const TABLE_NAME = process.env.DB_TABLE_NAME || 'records';
 const USE_DYNAMIC_SCHEMA = process.env.USE_DYNAMIC_SCHEMA !== 'false'; // Default to true
 const STORAGE_DIR = process.env.STORAGE_DIR || path.join(process.cwd(), 'storage');
 const STORAGE_MAX_AGE_MS = parseInt(process.env.STORAGE_MAX_AGE_MS || '3600000', 10); // 1 hour default
+
+// Parse job interface
+interface ParseJob {
+  req: Request;
+  res: Response | null;
+  next: NextFunction;
+  filePath: string;
+  originalName: string;
+  batchId: string;
+  jobId?: string;
+  isApi?: boolean;
+  userDelimiter?: string;
+  metadata?: Record<string, string>;
+}
+
+// Create a queue that processes 1 file at a time
+const parseQueue: QueueObject<ParseJob> = asyncQueue(async (job: ParseJob) => {
+  console.log(`[Queue] Starting processing (queue length: ${parseQueue.length()}, running: ${parseQueue.running()})`);
+  await processParseJob(job);
+  console.log(`[Queue] Finished processing (queue length: ${parseQueue.length()}, running: ${parseQueue.running()})`);
+}, 1); // concurrency = 1 (one file at a time)
+
+// Queue event handlers
+parseQueue.error((err, job) => {
+  console.error('[Queue] Job failed with error:', err);
+});
+
+parseQueue.drain(() => {
+  console.log('[Queue] All jobs processed, queue is now empty');
+});
 
 // Store API job results temporarily (in production, use Redis)
 const apiJobResults = new Map<string, any>();
@@ -73,7 +103,14 @@ function cleanupOldStorageFiles(): void {
 cleanupOldStorageFiles();
 
 app.get('/health', (req: Request, res: Response): void => {
-  res.json({ status: 'ok' });
+  res.json({
+    status: 'ok',
+    queue: {
+      length: parseQueue.length(),
+      running: parseQueue.running(),
+      idle: parseQueue.idle(),
+    }
+  });
 });
 
 app.get('/', (req: Request, res: Response): void => {
@@ -88,6 +125,7 @@ app.post('/api/parse', uploadMiddleware, async (req: Request, res: Response, nex
   const originalName = (req as any).originalName as string;
   const userDelimiter = req.body?.delimiter;
   const jobId = `job-${Date.now()}-${Math.round(Math.random() * 1E9)}`;
+  const batchId = `batch-${Date.now()}-${Math.round(Math.random() * 1E9)}`;
 
   // Extract optional uploader metadata from multipart form fields
   const metadata: Record<string, string> = {};
@@ -120,7 +158,8 @@ app.post('/api/parse', uploadMiddleware, async (req: Request, res: Response, nex
     // Initialize job status
     apiJobResults.set(jobId, {
       id: jobId,
-      status: 'processing',
+      status: 'queued',
+      queuePosition: parseQueue.length() + (parseQueue.running() > 0 ? 1 : 0),
       progress: 0,
       current: 0,
       total: totalRecordCount,
@@ -136,23 +175,35 @@ app.post('/api/parse', uploadMiddleware, async (req: Request, res: Response, nex
       console.log(`[API] Cleaned up job result: ${jobId}`);
     }, JOB_RESULT_TTL);
 
+    // Add to queue
+    parseQueue.push({
+      req,
+      res: null as any, // No SSE for API endpoint
+      next,
+      filePath,
+      originalName,
+      batchId,
+      jobId,
+      isApi: true,
+      userDelimiter,
+      metadata,
+    } as any);
+
     // Return job ID immediately
     res.json({
       success: true,
       jobId,
-      status: 'processing',
+      status: 'queued',
+      queuePosition: parseQueue.length(),
       totalRecords: totalRecordCount,
       metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
       statusUrl: `/api/status/${jobId}`,
       resultUrl: `/api/result/${jobId}`,
     });
-
-    // Process file in background
-    processFileInBackground(jobId, filePath, detectedFormat, originalName, metadata);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('[API] Error:', errorMessage);
-    
+
     if (apiJobResults.has(jobId)) {
       apiJobResults.set(jobId, {
         ...apiJobResults.get(jobId),
@@ -160,12 +211,12 @@ app.post('/api/parse', uploadMiddleware, async (req: Request, res: Response, nex
         error: errorMessage,
       });
     }
-    
+
     // Clean up file
     if (filePath && fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
     }
-    
+
     next(error);
   }
 });
@@ -223,173 +274,32 @@ app.get('/api/result/:jobId', (req: Request, res: Response): void => {
 });
 
 /**
- * Process file in background for API requests
+ * Process a parse job from the queue
  */
-async function processFileInBackground(
-  jobId: string,
-  filePath: string,
-  detectedFormat: any,
-  originalName: string,
-  metadata: Record<string, string> = {}
-): Promise<void> {
-  let dbClient: any = null;
-  const batchId = `batch-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+async function processParseJob(job: ParseJob): Promise<void> {
+  const { req, res, next, filePath, originalName, batchId, jobId, isApi, userDelimiter, metadata } = job;
+  let fileStream: Readable | undefined;
 
-  const updateJob = (updates: any) => {
-    const current = apiJobResults.get(jobId) || {};
-    apiJobResults.set(jobId, { ...current, ...updates, updatedAt: new Date().toISOString() });
+  console.log(`[Queue] Processing file: ${filePath}`);
+  console.log(`[Parse] Starting parse with batch ID: ${batchId}`);
+
+  // Helper function to update job status (for API)
+  const updateJobStatus = (updates: any) => {
+    if (isApi && jobId) {
+      const current = apiJobResults.get(jobId) || {};
+      apiJobResults.set(jobId, { ...current, ...updates, updatedAt: new Date().toISOString() });
+    }
   };
 
-  try {
-    const fileStream = fs.createReadStream(filePath);
-    
-    // Get database client
-    if (USE_DATABASE) {
-      try {
-        dbClient = await getClient(TABLE_NAME);
-        await dbClient.query('BEGIN');
-      } catch (dbError) {
-        console.warn('[API] Database connection failed, continuing without database:', dbError);
-      }
+  // Helper function to send progress (for SSE)
+  const sendProgress = (progress: number, current: number, total: number): void => {
+    if (res) {
+      res.write(`data: ${JSON.stringify({ progress, current, total })}\n\n`);
     }
-
-    // Determine schema
-    let schema = defaultSchema;
-    if (USE_DYNAMIC_SCHEMA && detectedFormat.sampleHeaders) {
-      schema = createDynamicSchema(detectedFormat.sampleHeaders);
+    if (isApi) {
+      updateJobStatus({ progress, current, total, status: 'processing' });
     }
-
-    let recordCount = 0;
-    const sampleRecords: ParsedObject[] = [];
-    let batch: ParsedObject[] = [];
-    let lastBatchInsertTime = Date.now();
-    const parseOptions = createParseOptions(detectedFormat);
-
-    await parseCSVStream(fileStream, schema, async (record) => {
-      recordCount++;
-
-      // Safety check
-      if (batch.length >= MAX_BATCH_SIZE) {
-        if (USE_DATABASE && dbClient) {
-          try {
-            await insertRecordsBatch(dbClient, batch, TABLE_NAME, batchId, metadata);
-            batch = [];
-            lastBatchInsertTime = Date.now();
-          } catch (dbError) {
-            console.error('[API] Forced batch insert error:', dbError);
-            batch = [];
-          }
-        } else {
-          batch = [];
-        }
-      }
-
-      batch.push(record);
-
-      // Collect samples
-      if (sampleRecords.length < 20) {
-        sampleRecords.push(JSON.parse(JSON.stringify(record)));
-      }
-
-      // Flush batch
-      const timeSinceLastInsert = Date.now() - lastBatchInsertTime;
-      const shouldFlushByTime = batch.length > 0 && timeSinceLastInsert >= BATCH_FLUSH_INTERVAL_MS;
-
-      if (USE_DATABASE && dbClient && (batch.length >= BATCH_SIZE || shouldFlushByTime)) {
-        try {
-          await insertRecordsBatch(dbClient, batch, TABLE_NAME, batchId, metadata);
-          batch = [];
-          lastBatchInsertTime = Date.now();
-        } catch (dbError) {
-          console.error('[API] Database insert error:', dbError);
-          batch = [];
-        }
-      }
-
-      // Update progress every 1000 records
-      if (recordCount % 1000 === 0) {
-        const job = apiJobResults.get(jobId);
-        const progress = job?.total ? Math.min(100, Math.floor((recordCount / job.total) * 100)) : 0;
-        updateJob({ progress, current: recordCount });
-      }
-
-      // Trigger GC every 100 records
-      if (recordCount % 100 === 0 && global.gc) {
-        global.gc();
-      }
-    }, parseOptions);
-
-    // Insert remaining records
-    if (USE_DATABASE && dbClient && batch.length > 0) {
-      await insertRecordsBatch(dbClient, batch, TABLE_NAME, batchId, metadata);
-    }
-
-    // Commit transaction
-    if (USE_DATABASE && dbClient) {
-      await dbClient.query('COMMIT');
-    }
-
-    // Update job with final result
-    updateJob({
-      status: 'completed',
-      progress: 100,
-      current: recordCount,
-      result: {
-        count: recordCount,
-        sample: sampleRecords,
-        format: detectedFormat.format,
-        delimiter: detectedFormat.delimiter === '\t' ? 'tab' : detectedFormat.delimiter,
-        batchId: USE_DATABASE ? batchId : undefined,
-        metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
-      },
-      completedAt: new Date().toISOString(),
-    });
-
-    console.log(`[API] Job ${jobId} completed: ${recordCount} records`);
-  } catch (error) {
-    if (USE_DATABASE && dbClient) {
-      try {
-        await dbClient.query('ROLLBACK');
-      } catch (rollbackError) {
-        console.error('[API] Error during rollback:', rollbackError);
-      }
-    }
-
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    console.error(`[API] Job ${jobId} failed:`, errorMessage);
-    
-    updateJob({
-      status: 'failed',
-      error: errorMessage,
-      failedAt: new Date().toISOString(),
-    });
-  } finally {
-    if (dbClient) {
-      dbClient.release();
-    }
-    
-    // Clean up file
-    if (filePath && fs.existsSync(filePath)) {
-      try {
-        fs.unlinkSync(filePath);
-      } catch (unlinkError) {
-        console.error('[API] Error deleting temp file:', unlinkError);
-      }
-    }
-  }
-}
-
-app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-  const filePath = (req as any).filePath as string;
-  const originalName = (req as any).originalName as string;
-  const userDelimiter = req.body?.delimiter; // User's delimiter preference (optional)
-  let fileStream: Readable | undefined;
-  let dbClient: any = null;
-  const batchId = `batch-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-
-  console.log(`[Upload] File saved to: ${filePath}`);
-  console.log(`[Upload] Original filename: ${originalName}`);
-  console.log(`[Parse] Starting parse with batch ID: ${batchId}`);
+  };
 
   // Helper function to clean up temporary file
   const cleanupFile = () => {
@@ -406,9 +316,8 @@ app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: N
   try {
     // Detect file format (CSV, TSV, or TXT) or use user preference
     let detectedFormat = detectFileFormat(filePath);
-    
+
     if (userDelimiter) {
-      // User specified delimiter overrides auto-detection
       detectedFormat.delimiter = userDelimiter;
       console.log(`[Parse] Using user-specified delimiter: ${userDelimiter === '\t' ? 'TAB' : userDelimiter}`);
     } else {
@@ -422,31 +331,36 @@ app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: N
     // Create a fresh stream for parsing
     fileStream = fs.createReadStream(filePath);
     if (!fileStream) {
-      cleanupFile(); // Clean up before returning
-      res.status(400).json({ error: 'No file stream available' });
+      cleanupFile();
+      if (res) {
+        res.status(400).json({ error: 'No file stream available' });
+      } else if (isApi) {
+        updateJobStatus({ status: 'failed', error: 'No file stream available' });
+      }
       return;
     }
 
-    // Set up Server-Sent Events for progress updates
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
-
-    const sendProgress = (progress: number, current: number, total: number): void => {
-      res.write(`data: ${JSON.stringify({ progress, current, total })}\n\n`);
-    };
+    // Set up Server-Sent Events for progress updates (if not API mode)
+    if (res) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+    }
 
     // Send initial progress with total count
     sendProgress(0, 0, totalRecordCount);
+    if (isApi) {
+      updateJobStatus({ status: 'processing', totalRecords: totalRecordCount });
+    }
 
-    // Get database client and start transaction (if database is enabled)
+    // Ensure table exists (if database is enabled)
     if (USE_DATABASE) {
       try {
-        dbClient = await getClient(TABLE_NAME);
-        await dbClient.query('BEGIN');
+        await ensureTableExists();
       } catch (dbError) {
         console.warn('[Parse] Database connection failed, continuing without database:', dbError);
+        // Continue without database for local testing
       }
     }
 
@@ -474,13 +388,14 @@ app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: N
       // Safety check: prevent batch from growing too large
       if (batch.length >= MAX_BATCH_SIZE) {
         console.warn(`[Parse] Batch size exceeded ${MAX_BATCH_SIZE}, forcing insert to prevent memory issues`);
-        if (USE_DATABASE && dbClient) {
+        if (USE_DATABASE) {
           try {
-            await insertRecordsBatch(dbClient, batch, TABLE_NAME, batchId);
+            await upsertRecordsBatch(batch, metadata);
             batch = [];
             lastBatchInsertTime = Date.now();
           } catch (dbError) {
             console.error('[Parse] Forced batch insert error:', dbError);
+            // Clear batch even on error to prevent memory issues
             batch = [];
           }
         } else {
@@ -496,37 +411,41 @@ app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: N
         sampleRecords.push(recordCopy);
       }
 
-      // Check if we need to flush based on time
+      // Check if we need to flush based on time (prevent stale batches)
       const timeSinceLastInsert = Date.now() - lastBatchInsertTime;
       const shouldFlushByTime = batch.length > 0 && timeSinceLastInsert >= BATCH_FLUSH_INTERVAL_MS;
 
-      // Insert batch when it reaches the batch size or time limit
-      if (USE_DATABASE && dbClient && (batch.length >= BATCH_SIZE || shouldFlushByTime)) {
+      // Upsert batch when it reaches the batch size or time limit (if database is enabled)
+      if (USE_DATABASE && (batch.length >= BATCH_SIZE || shouldFlushByTime)) {
         try {
-          await insertRecordsBatch(dbClient, batch, TABLE_NAME, batchId);
+          await upsertRecordsBatch(batch, metadata);
           batch = [];
           lastBatchInsertTime = Date.now();
         } catch (dbError) {
-          console.error('[Parse] Database insert error:', dbError);
+          console.error('[Parse] Database upsert error:', dbError);
+          // Always clear batch on error to prevent memory accumulation
           batch = [];
+          // Continue parsing even if database upsert fails
         }
       }
 
       // Calculate and send progress updates
       if (totalRecordCount > 0) {
         const progressPercent = Math.min(100, Math.floor((recordCount / totalRecordCount) * 100));
+        // Send progress update when percentage changes or every 1000 records
         if (progressPercent !== lastProgressSent || recordCount % 1000 === 0) {
           sendProgress(progressPercent, recordCount, totalRecordCount);
           lastProgressSent = progressPercent;
         }
       } else {
+        // If we don't know the total, still send updates periodically
         if (recordCount % 1000 === 0) {
           sendProgress(0, recordCount, 0);
         }
       }
 
-      // Trigger manual GC and log memory every 100 records (--expose-gc flag in package.json)
-      if (recordCount % 100 === 0) {
+      // Trigger manual GC every 100K records (--expose-gc flag in package.json)
+      if (recordCount % 100000 === 0) {
         console.log(`[Parse] Processed ${recordCount.toLocaleString()} records...`);
         if (global.gc) {
           global.gc();
@@ -536,69 +455,111 @@ app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: N
       }
     }, parseOptions);
 
-    // Insert remaining records in batch
-    if (USE_DATABASE && dbClient && batch.length > 0) {
+    // Upsert remaining records in batch (if database is enabled)
+    if (USE_DATABASE && batch.length > 0) {
       try {
-        await insertRecordsBatch(dbClient, batch, TABLE_NAME, batchId);
+        await upsertRecordsBatch(batch, metadata);
       } catch (dbError) {
-        console.error('[Parse] Database insert error:', dbError);
+        console.error('[Parse] Database upsert error:', dbError);
       }
     }
 
-    // Commit transaction
-    if (USE_DATABASE && dbClient) {
-      try {
-        await dbClient.query('COMMIT');
-        console.log(`[Parse] Successfully inserted ${recordCount.toLocaleString()} records into database`);
-      } catch (dbError) {
-        console.error('[Parse] Database commit error:', dbError);
-        try {
-          await dbClient.query('ROLLBACK');
-        } catch (rollbackError) {
-          console.error('[Parse] Error during rollback:', rollbackError);
-        }
-      }
+    if (USE_DATABASE) {
+      console.log(`[Parse] Successfully upserted ${recordCount.toLocaleString()} records into database`);
     } else {
       console.log(`[Parse] Parsed ${recordCount.toLocaleString()} records (database disabled)`);
     }
 
     // Send final progress and result
     sendProgress(100, recordCount, totalRecordCount);
-    res.write(`data: ${JSON.stringify({
+
+    const finalResult = {
       done: true,
       count: recordCount,
       sample: sampleRecords,
       format: detectedFormat.format,
       delimiter: detectedFormat.delimiter === '\t' ? 'tab' : detectedFormat.delimiter,
       batchId: USE_DATABASE ? batchId : undefined,
-    })}\n\n`);
-    res.end();
-  } catch (error) {
-    // Rollback transaction on error
-    if (USE_DATABASE && dbClient) {
-      try {
-        await dbClient.query('ROLLBACK');
-      } catch (rollbackError) {
-        console.error('[Parse] Error during rollback:', rollbackError);
-      }
+      metadata: metadata && Object.keys(metadata).length > 0 ? metadata : undefined,
+    };
+
+    if (res) {
+      res.write(`data: ${JSON.stringify(finalResult)}\n\n`);
+      res.end();
     }
 
+    if (isApi) {
+      updateJobStatus({
+        status: 'completed',
+        progress: 100,
+        current: recordCount,
+        result: finalResult,
+        completedAt: new Date().toISOString(),
+      });
+    }
+  } catch (error) {
     // Send error via SSE before ending
     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
     console.error('[Parse] Error:', errorMessage);
     console.error('[Parse] Parsing failed - cleaning up temporary file');
-    res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
-    res.end();
-    next(error);
-  } finally {
-    // Release database client
-    if (dbClient) {
-      dbClient.release();
+
+    if (res) {
+      res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
+      res.end();
     }
 
+    if (isApi) {
+      updateJobStatus({
+        status: 'failed',
+        error: errorMessage,
+        failedAt: new Date().toISOString(),
+      });
+    }
+
+    if (next) next(error);
+  } finally {
     // Clean up temporary file (always executes, even on error)
     cleanupFile();
   }
+}
+
+app.post('/parse', uploadMiddleware, async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  const filePath = (req as any).filePath as string;
+  const originalName = (req as any).originalName as string;
+  const userDelimiter = req.body?.delimiter;
+  const batchId = `batch-${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+
+  console.log(`[Upload] File saved to: ${filePath}`);
+  console.log(`[Upload] Original filename: ${originalName}`);
+  console.log(`[Queue] Current queue length: ${parseQueue.length()}`);
+  console.log(`[Queue] Adding job to queue (batch ID: ${batchId})`);
+
+  // Set up Server-Sent Events immediately
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+
+  // Send queue position info
+  const queuePosition = parseQueue.length() + (parseQueue.running() > 0 ? 1 : 0);
+  if (queuePosition > 1) {
+    res.write(`data: ${JSON.stringify({
+      queued: true,
+      position: queuePosition,
+      message: `In queue. Position: ${queuePosition}. Processing will start soon...`
+    })}\n\n`);
+  }
+
+  // Add job to queue
+  parseQueue.push({
+    req,
+    res,
+    next,
+    filePath,
+    originalName,
+    batchId,
+    userDelimiter,
+  });
 });
 
 app.use((err: Error, req: Request, res: Response, next: NextFunction): void => {
@@ -611,7 +572,7 @@ process.on('uncaughtException', async (err: Error) => {
   console.error('UNCAUGHT EXCEPTION! Shutting down...');
   console.error(err.name, err.message);
   console.error(err.stack);
-  
+
   // Attempt cleanup before crash
   console.log('[Emergency] Attempting to clean up storage directory...');
   try {
@@ -619,10 +580,10 @@ process.on('uncaughtException', async (err: Error) => {
   } catch (cleanupErr) {
     console.error('[Emergency] Cleanup failed:', cleanupErr);
   }
-  
+
   if (USE_DATABASE) {
     try {
-      await closePool();
+      await closeDb();
     } catch (poolErr) {
       console.error('[Emergency] Pool close failed:', poolErr);
     }
@@ -634,10 +595,10 @@ process.on('uncaughtException', async (err: Error) => {
 process.on('unhandledRejection', async (reason: any) => {
   console.error('UNHANDLED REJECTION! Shutting down...');
   console.error(reason);
-  
+
   if (USE_DATABASE) {
     try {
-      await closePool();
+      await closeDb();
     } catch (poolErr) {
       console.error('[Emergency] Pool close failed:', poolErr);
     }
@@ -649,7 +610,7 @@ process.on('unhandledRejection', async (reason: any) => {
 process.on('SIGTERM', async () => {
   console.log('SIGTERM received, closing database pool...');
   if (USE_DATABASE) {
-    await closePool();
+    await closeDb();
   }
   process.exit(0);
 });
@@ -657,7 +618,7 @@ process.on('SIGTERM', async () => {
 process.on('SIGINT', async () => {
   console.log('SIGINT received, closing database pool...');
   if (USE_DATABASE) {
-    await closePool();
+    await closeDb();
   }
   process.exit(0);
 });
@@ -665,7 +626,7 @@ process.on('SIGINT', async () => {
 app.listen(PORT, () => {
   console.log(`CSV/TSV Parser server running on port ${PORT}`);
   if (USE_DATABASE) {
-    console.log(`Database mode: ENABLED (table: ${TABLE_NAME})`);
+    console.log(`Database mode: ENABLED (table: csv_records)`);
   } else {
     console.log(`Database mode: DISABLED (local testing mode)`);
   }

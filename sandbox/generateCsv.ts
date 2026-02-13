@@ -2,6 +2,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Writable } from 'stream';
 
+// @ts-ignore – sandbox file is outside tsconfig include; runs via ts-node
+const crypto = require('crypto') as { randomUUID: () => string };
+
 // Sample data pools for generating realistic records
 const firstNames = ['John', 'Jane', 'Michael', 'Sarah', 'David', 'Emily', 'Chris', 'Jessica', 'Daniel', 'Ashley'];
 const lastNames = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez'];
@@ -37,9 +40,10 @@ function randomEmail(firstName: string, lastName: string): string {
 function generateRandomRecord(id: number): string[] {
   const firstName = randomElement(firstNames);
   const lastName = randomElement(lastNames);
-  
+
   return [
     String(id),                                    // id
+    crypto.randomUUID(),                           // uuid
     firstName,                                     // first_name
     lastName,                                      // last_name
     randomEmail(firstName, lastName),              // email
@@ -70,6 +74,7 @@ function generateCSVFile(numRecords: number, outputPath: string, delimiter: stri
   return new Promise((resolve, reject) => {
     const headers = [
       'id',
+      'uuid',
       'first_name',
       'last_name',
       'email',
@@ -87,63 +92,63 @@ function generateCSVFile(numRecords: number, outputPath: string, delimiter: stri
     ];
 
     const writeStream = fs.createWriteStream(outputPath, { encoding: 'utf-8' });
-    
+
     writeStream.on('error', (err) => {
       reject(err);
     });
-    
+
     writeStream.on('finish', () => {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       const fileSize = fs.statSync(outputPath).size;
       const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(1);
-      
+
       console.log(`\n✓ Generated CSV file:`);
       console.log(`  Path: ${outputPath}`);
       console.log(`  Records: ${numRecords.toLocaleString()}`);
       console.log(`  Size: ${fileSizeMB} MB`);
       console.log(`  Time: ${elapsed}s`);
       console.log(`  Delimiter: ${delimiter === '\t' ? 'TAB' : delimiter}`);
-      
+
       resolve();
     });
-    
+
     // Write header
     writeStream.write(headers.join(delimiter) + '\n');
-    
+
     const batchSize = 1000;
     let batch: string[] = [];
-    
+
     console.log(`Generating CSV file with ${numRecords.toLocaleString()} records...`);
     const startTime = Date.now();
-    
+
     for (let i = 1; i <= numRecords; i++) {
       const record = generateRandomRecord(i);
       const line = record.map(escapeCSV).join(delimiter);
       batch.push(line);
-      
+
       // Write batch when it reaches batchSize
       if (batch.length >= batchSize) {
         writeStream.write(batch.join('\n') + '\n');
         batch = [];
       }
-      
+
       // Progress logging
       if (i % 100000 === 0) {
         const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
         console.log(`  Generated ${i.toLocaleString()} records (${elapsed}s)...`);
-        
+
         // Manual GC if available
         if (global.gc) {
           global.gc();
         }
       }
     }
-    
+
     // Write remaining batch
     if (batch.length > 0) {
       writeStream.write(batch.join('\n') + '\n');
     }
-    
+
     writeStream.end();
   });
 }

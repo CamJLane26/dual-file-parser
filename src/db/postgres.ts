@@ -1,174 +1,115 @@
-import { Pool, PoolClient } from 'pg';
+import pgPromise from 'pg-promise';
 import { ParsedObject } from '../types/csv';
 
-let pool: Pool | null = null;
+const pgp = pgPromise();
+
+// Column set for batch upserts using pgp.helpers
+const recordColumns = new pgp.helpers.ColumnSet(
+  [
+    'name',
+    'uuid',
+    { name: 'data', cast: 'jsonb' },
+    { name: 'metadata', cast: 'jsonb', def: null },
+    { name: 'created_at', def: 'NOW()', mod: ':raw' },
+  ],
+  { table: { table: 'csv_records', schema: 'public' } }
+);
+
+let db: pgPromise.IDatabase<{}> | null = null;
 
 /**
- * Initialize PostgreSQL connection pool
+ * Get the pg-promise database instance (lazy-initialized)
  */
-export function initializePool(): Pool {
-  if (pool) {
-    return pool;
-  }
+export function getDb(): pgPromise.IDatabase<{}> {
+  if (db) return db;
 
-  pool = new Pool({
+  db = pgp({
     host: process.env.DB_HOST || 'localhost',
     port: parseInt(process.env.DB_PORT || '5432', 10),
-    database: process.env.DB_NAME || 'csvparser',
+    database: process.env.DB_NAME || 'xmlparser',
     user: process.env.DB_USER || 'postgres',
     password: process.env.DB_PASSWORD || '',
-    max: parseInt(process.env.DB_POOL_MAX || '20', 10),
-    idleTimeoutMillis: parseInt(process.env.DB_IDLE_TIMEOUT || '30000', 10),
-    connectionTimeoutMillis: parseInt(process.env.DB_CONNECTION_TIMEOUT || '2000', 10),
+    max: parseInt(process.env.DB_POOL_MAX || '5', 10),
   });
 
-  pool.on('error', (err: Error) => {
-    console.error('Unexpected error on idle client', err);
-  });
-
-  return pool;
+  return db;
 }
 
 /**
- * Get the connection pool
+ * Close the database connection (for graceful shutdown)
  */
-export function getPool(): Pool {
-  if (!pool) {
-    return initializePool();
-  }
-  return pool;
-}
-
-/**
- * Close the connection pool (for graceful shutdown)
- */
-export async function closePool(): Promise<void> {
-  if (pool) {
-    await pool.end();
-    pool = null;
+export async function closeDb(): Promise<void> {
+  if (db) {
+    pgp.end();
+    db = null;
   }
 }
 
 /**
- * Insert a batch of records into the database
- * Uses a transaction to ensure all-or-nothing insertion
+ * Ensure the csv_records table exists (idempotent)
  */
-export async function insertRecordsBatch(
-  client: PoolClient,
+export async function ensureTableExists(): Promise<void> {
+  const database = getDb();
+  await database.none(`
+    CREATE TABLE IF NOT EXISTS public.csv_records (
+      id INTEGER PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+      name TEXT NOT NULL,
+      uuid TEXT NOT NULL,
+      data JSONB NOT NULL,
+      metadata JSONB,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT csv_records_uuid_unique UNIQUE (uuid)
+    )
+  `);
+}
+
+/**
+ * Upsert a batch of parsed CSV/TSV records using pgp.helpers.
+ * On uuid conflict, updates name, data, metadata, and created_at.
+ */
+export async function upsertRecordsBatch(
   records: ParsedObject[],
-  tableName: string = 'records',
-  batchId?: string,
   metadata?: Record<string, string>
 ): Promise<number> {
-  if (records.length === 0) {
-    return 0;
-  }
+  if (records.length === 0) return 0;
+
+  const database = getDb();
+  const delayMs = parseInt(process.env.DB_INSERT_DELAY_MS || '0', 10);
 
   const metadataJson = metadata && Object.keys(metadata).length > 0
     ? JSON.stringify(metadata)
     : null;
 
-  // Build the INSERT query with parameterized values
-  const values: unknown[] = [];
-  const placeholders: string[] = [];
-  let paramIndex = 1;
+  // Build rows for the column set
+  const rows = records.map((record) => ({
+    name: (record.name as string) || (record.first_name as string) || '',
+    uuid: (record.uuid as string) || '',
+    data: JSON.stringify(record),
+    metadata: metadataJson,
+  }));
 
-  for (const record of records) {
-    const recordJson = JSON.stringify(record);
-    placeholders.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3})`);
-    values.push(batchId || null, recordJson, metadataJson, new Date());
-    paramIndex += 4;
+  // Log each record being upserted
+  for (const row of rows) {
+    console.log(`[DB] Upserting record: name="${row.name}", uuid="${row.uuid}"`);
   }
 
-  const query = `
-    INSERT INTO ${tableName} (batch_id, data, metadata, created_at)
-    VALUES ${placeholders.join(', ')}
-  `;
+  const insert = pgp.helpers.insert(rows, recordColumns);
+  const onConflict =
+    ' ON CONFLICT (uuid) DO UPDATE SET ' +
+    'name = EXCLUDED.name, ' +
+    'data = EXCLUDED.data, ' +
+    'metadata = EXCLUDED.metadata, ' +
+    'created_at = EXCLUDED.created_at';
 
-  const result = await client.query(query, values);
-  return result.rowCount || 0;
-}
+  const query = insert + onConflict;
+  const result = await database.result(query);
 
-/**
- * Create the records table if it doesn't exist
- */
-export async function ensureTableExists(
-  client: PoolClient,
-  tableName: string = 'records'
-): Promise<void> {
-  const createTableQuery = `
-    CREATE TABLE IF NOT EXISTS ${tableName} (
-      id SERIAL PRIMARY KEY,
-      batch_id VARCHAR(255),
-      data JSONB NOT NULL,
-      metadata JSONB,
-      created_at TIMESTAMP NOT NULL DEFAULT NOW()
-    )
-  `;
+  console.log(`[DB] Upserted ${result.rowCount} row(s)`);
 
-  await client.query(createTableQuery);
-
-  // Create indexes if they don't exist
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_${tableName}_batch_id ON ${tableName}(batch_id)
-  `);
-
-  await client.query(`
-    CREATE INDEX IF NOT EXISTS idx_${tableName}_created_at ON ${tableName}(created_at)
-  `);
-}
-
-/**
- * Get a client from the pool and ensure table exists
- */
-export async function getClient(tableName: string = 'records'): Promise<PoolClient> {
-  const pool = getPool();
-  const client = await pool.connect();
-
-  try {
-    await ensureTableExists(client, tableName);
-  } catch (error) {
-    client.release();
-    throw error;
+  // Optional throttle for debugging (set DB_INSERT_DELAY_MS env var)
+  if (delayMs > 0) {
+    await new Promise((r) => setTimeout(r, delayMs));
   }
 
-  return client;
-}
-
-/**
- * Query records by batch ID
- */
-export async function getRecordsByBatchId(
-  client: PoolClient,
-  batchId: string,
-  tableName: string = 'records',
-  limit: number = 100,
-  offset: number = 0
-): Promise<ParsedObject[]> {
-  const query = `
-    SELECT data FROM ${tableName}
-    WHERE batch_id = $1
-    ORDER BY id
-    LIMIT $2 OFFSET $3
-  `;
-
-  const result = await client.query(query, [batchId, limit, offset]);
-  return result.rows.map(row => row.data);
-}
-
-/**
- * Count records by batch ID
- */
-export async function countRecordsByBatchId(
-  client: PoolClient,
-  batchId: string,
-  tableName: string = 'records'
-): Promise<number> {
-  const query = `
-    SELECT COUNT(*) as count FROM ${tableName}
-    WHERE batch_id = $1
-  `;
-
-  const result = await client.query(query, [batchId]);
-  return parseInt(result.rows[0].count, 10);
+  return result.rowCount;
 }
